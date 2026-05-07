@@ -426,7 +426,7 @@ __global__ void kernelRenderCircles() {
         }
     }
 }
-
+/*
 __global__ void kernelRenderPixels() {
 
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
@@ -494,6 +494,169 @@ __global__ void kernelRenderPixels() {
     }
 
     *(float4*)(&cuConstRendererParams.imageData[pixelOffset]) = pixelColor;
+}*/
+
+__device__ __inline__ bool circleIntersectsBoxConservative(
+    float cx, float cy, float radius,
+    float boxL, float boxR, float boxB, float boxT)
+{
+    float closestX = fminf(fmaxf(cx, boxL), boxR);
+    float closestY = fminf(fmaxf(cy, boxB), boxT);
+
+    float dx = cx - closestX;
+    float dy = cy - closestY;
+
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+#define TILE_W 16
+#define TILE_H 16
+#define CIRCLE_BATCH 256
+
+__global__ void kernelRenderPixelsTiled() {
+
+    __shared__ float s_posX[CIRCLE_BATCH];
+    __shared__ float s_posY[CIRCLE_BATCH];
+    __shared__ float s_posZ[CIRCLE_BATCH];
+    __shared__ float s_radius[CIRCLE_BATCH];
+    __shared__ float s_colorR[CIRCLE_BATCH];
+    __shared__ float s_colorG[CIRCLE_BATCH];
+    __shared__ float s_colorB[CIRCLE_BATCH];
+    __shared__ int   s_active[CIRCLE_BATCH];
+
+    int pixelX = blockIdx.x * TILE_W + threadIdx.x;
+    int pixelY = blockIdx.y * TILE_H + threadIdx.y;
+
+    int width = cuConstRendererParams.imageWidth;
+    int height = cuConstRendererParams.imageHeight;
+
+    int localId = threadIdx.y * blockDim.x + threadIdx.x;
+
+    float invWidth = 1.f / width;
+    float invHeight = 1.f / height;
+
+    int tileMinX = blockIdx.x * TILE_W;
+    int tileMaxX = min(tileMinX + TILE_W, width);
+    int tileMinY = blockIdx.y * TILE_H;
+    int tileMaxY = min(tileMinY + TILE_H, height);
+
+    float boxL = tileMinX * invWidth;
+    float boxR = tileMaxX * invWidth;
+    float boxB = tileMinY * invHeight;
+    float boxT = tileMaxY * invHeight;
+
+    bool validPixel = pixelX < width && pixelY < height;
+
+    float pixelCenterX = invWidth * (static_cast<float>(pixelX) + 0.5f);
+    float pixelCenterY = invHeight * (static_cast<float>(pixelY) + 0.5f);
+
+    int pixelOffset = 4 * (pixelY * width + pixelX);
+
+    float4 pixelColor;
+
+    if (validPixel) {
+        pixelColor = *(float4*)(&cuConstRendererParams.imageData[pixelOffset]);
+    }
+
+    bool snowScene =
+        cuConstRendererParams.sceneName == SNOWFLAKES ||
+        cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME;
+
+    for (int batchStart = 0;
+         batchStart < cuConstRendererParams.numCircles;
+         batchStart += CIRCLE_BATCH) {
+
+        int circleIndex = batchStart + localId;
+
+        if (localId < CIRCLE_BATCH && circleIndex < cuConstRendererParams.numCircles) {
+
+            int index3 = 3 * circleIndex;
+
+            float px = cuConstRendererParams.position[index3];
+            float py = cuConstRendererParams.position[index3 + 1];
+            float pz = cuConstRendererParams.position[index3 + 2];
+            float rad = cuConstRendererParams.radius[circleIndex];
+
+            s_posX[localId] = px;
+            s_posY[localId] = py;
+            s_posZ[localId] = pz;
+            s_radius[localId] = rad;
+
+            if (!snowScene) {
+                s_colorR[localId] = cuConstRendererParams.color[index3];
+                s_colorG[localId] = cuConstRendererParams.color[index3 + 1];
+                s_colorB[localId] = cuConstRendererParams.color[index3 + 2];
+            }
+
+            s_active[localId] = circleIntersectsBoxConservative(
+                px, py, rad, boxL, boxR, boxB, boxT
+            ) ? 1 : 0;
+
+        } else if (localId < CIRCLE_BATCH) {
+            s_active[localId] = 0;
+        }
+
+        __syncthreads();
+
+        int batchSize = min(CIRCLE_BATCH, cuConstRendererParams.numCircles - batchStart);
+
+        if (validPixel) {
+
+            for (int i = 0; i < batchSize; i++) {
+
+                if (!s_active[i])
+                    continue;
+
+                float px = s_posX[i];
+                float py = s_posY[i];
+                float pz = s_posZ[i];
+                float rad = s_radius[i];
+
+                float diffX = px - pixelCenterX;
+                float diffY = py - pixelCenterY;
+                float pixelDist = diffX * diffX + diffY * diffY;
+
+                if (pixelDist > rad * rad)
+                    continue;
+
+                float3 rgb;
+                float alpha;
+
+                if (snowScene) {
+
+                    const float kCircleMaxAlpha = .5f;
+                    const float falloffScale = 4.f;
+
+                    float normPixelDist = sqrtf(pixelDist) / rad;
+                    rgb = lookupColor(normPixelDist);
+
+                    float maxAlpha = .6f + .4f * (1.f - pz);
+                    maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+                    alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
+
+                } else {
+
+                    rgb.x = s_colorR[i];
+                    rgb.y = s_colorG[i];
+                    rgb.z = s_colorB[i];
+                    alpha = .5f;
+                }
+
+                float oneMinusAlpha = 1.f - alpha;
+
+                pixelColor.x = alpha * rgb.x + oneMinusAlpha * pixelColor.x;
+                pixelColor.y = alpha * rgb.y + oneMinusAlpha * pixelColor.y;
+                pixelColor.z = alpha * rgb.z + oneMinusAlpha * pixelColor.z;
+                pixelColor.w = alpha + pixelColor.w;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (validPixel) {
+        *(float4*)(&cuConstRendererParams.imageData[pixelOffset]) = pixelColor;
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -702,15 +865,16 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
-void 
+void
 CudaRenderer::render() {
-	dim3 blockDim(16, 16, 1);
-	dim3 gridDim(
-		(image->width + blockDim.x - 1) / blockDim.x,
-		(image->height + blockDim.y - 1) / blockDim.y
-	);
 
-	kernelRenderPixels<<<gridDim, blockDim>>>();
-	cudaDeviceSynchronize();
+    dim3 blockDim(TILE_W, TILE_H, 1);
+    dim3 gridDim(
+        (image->width + TILE_W - 1) / TILE_W,
+        (image->height + TILE_H - 1) / TILE_H
+    );
+
+    kernelRenderPixelsTiled<<<gridDim, blockDim>>>();
+    cudaDeviceSynchronize();
 }
 

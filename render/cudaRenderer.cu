@@ -511,7 +511,7 @@ __device__ __inline__ bool circleIntersectsBoxConservative(
 
 #define TILE_W 16
 #define TILE_H 16
-#define CIRCLE_BATCH 256
+#define CIRCLE_BATCH 128
 
 __global__ void kernelRenderPixelsTiled() {
 
